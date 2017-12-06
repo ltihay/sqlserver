@@ -1,7 +1,7 @@
 -- Creator: Laurent Tihay
--- Last update : 04/10/2017
+-- Last update : 09/11/2017
 -- provides a little audit of the instance and the databases
--- works for SQL 2005, 2008, 2008R2 and 2012
+-- works for SQL 2005, 2008, 2008R2, 2012, 2014
 -- !!! before running the audit : Check the size of the ERRORLOG and ERRORLOG.1 to .6, 
 -- 	if they are huge the audit can take a long time
 -- 	then don't run the parts where xp_readerrorlog is inserted
@@ -76,14 +76,38 @@ DECLARE @LICNUM	SQL_VARIANT
 DECLARE @LASTUPDATE	SQL_VARIANT
 DECLARE @RESVER	SQL_VARIANT
 DECLARE @SQLVER smallint
+DECLARE @SQLVER2 NVARCHAR(200)
 
 SET @PRODVER=(SELECT  SERVERPROPERTY('productversion'))
 PRINT 'Product Version			  : '+CONVERT(VARCHAR(20),@PRODVER)
 SET @SQLVER = 0
-IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '9.%' SET @SQLVER = 9
-IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '10.%' SET @SQLVER = 10
-IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '12.%' SET @SQLVER = 12 
-
+SET @SQLVER2 = NULL
+IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '9.%' 
+BEGIN
+	SET @SQLVER = 9
+	SET @SQLVER2 = 'SQL Server 2005'
+END
+IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '10.%'
+BEGIN
+	SET @SQLVER = 10
+	SET @SQLVER2 = 'SQL Server 2008'
+END
+IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '10.5%'
+BEGIN
+	SET @SQLVER = 10.5
+	SET @SQLVER2 = 'SQL Server 2008 R2'
+END
+IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '11.%'
+BEGIN
+	SET @SQLVER = 11
+	SET @SQLVER2 = 'SQL Server 2012'
+END
+IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '12.%'
+BEGIN
+	SET @SQLVER = 12
+	SET @SQLVER2 = 'SQL Server 2014'
+END
+PRINT @SQLVER2
 
 
 --Store version into a temp table
@@ -95,7 +119,7 @@ CREATE TABLE [tempdb].[dbo].[sqlver]
 [sqlver_value] smallint NOT NULL
 )
 INSERT INTO [tempdb].[dbo].[sqlver] values (@SQLVER)
-SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]
+--SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]
 
 
 SET @PRODLVL=(SELECT SERVERPROPERTY ('productlevel'))
@@ -123,7 +147,8 @@ SET NOCOUNT OFF
 --SET @PRODVER=(SELECT  SERVERPROPERTY('productversion'))
 --IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '9.%' GOTO SQL2005ver
 --IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '10.%' GOTO SQL2008ver
---IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '12.%' GOTO SQL2012ver 
+--IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '11.%' GOTO SQL2012_14ver
+--IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '12.%' GOTO SQL2012_14ver 
 
 
 PRINT ''
@@ -159,6 +184,32 @@ BEGIN
 	PRINT '**************************************************************************'
 	PRINT ''
 	SET NOCOUNT ON
+	-- update OnlineDb list if we are on SECONDARY node to not check user databases
+	declare @role smallint
+	set @role = (
+	select rs.role
+	from [sys].[dm_hadr_availability_replica_states] rs
+	JOIN [sys].[dm_hadr_availability_replica_cluster_states] rc
+	ON rs.replica_id = rc.replica_id
+	where rs.is_local = 1
+	)
+	--select @role
+	if @role = 2
+	BEGIN
+		TRUNCATE TABLE [tempdb].[dbo].[OnlineDB]
+		INSERT INTO [tempdb].[dbo].[OnlineDB] SELECT name FROM master.sys.databases WHERE  database_id < 5 AND state = 0
+		PRINT ''
+		PRINT 'WARNING !!! We are on the SECONDARY node, user databases won''t be checked'
+		PRINT ''
+	END
+	--select * from [tempdb].[dbo].[OnlineDB]
+	if @role = 1
+	BEGIN
+		PRINT 'We are on the PRIMARY node'
+		PRINT ''
+	END
+
+
 	IF EXISTS (SELECT * FROM tempdb..sysobjects
 	WHERE id = object_id(N'[tempdb]..[alwayson]'))
 	DROP TABLE [tempdb].[dbo].[alwayson]
@@ -205,15 +256,56 @@ BEGIN
 	join sys.dm_hadr_database_replica_states drs 
 	on rs.replica_id=drs.replica_id 
 	where n.replica_server_name <> @HADRName
-
+	
+	-- Availability mode
+	select replica_server_name
+		, endpoint_url
+		, availability_mode_desc
+		, failover_mode_desc
+		, secondary_role_allow_connections_desc 
+		, backup_priority
+	from sys.availability_replicas
+	
 	select * from [tempdb].[dbo].[alwayson]
 	select * from [tempdb].[dbo].[alwayson_status]
+
 	-- Update OnlineDB
 	--select DBName from [tempdb].[dbo].[alwayson_status] where role_desc = 'SECONDARY'
 	-- faire un curseur qui regarde pour chaque ligne de OnlineDb si la base n'est pas SECONDARY sur le serveur sur lequel on se trouve (si @@servername = select replica_server_name where role_desc = secondary)
+	-- Faire un curseur sur les bases e chaque replica et executer select sys.fn_hadr_backup_is_preferred_replica(@dbname)
+	
+--IF (select replica_server_name from [tempdb]..[alwayson]) = @@servername
+
+	IF EXISTS (SELECT * FROM tempdb..sysobjects
+	WHERE id = object_id(N'[tempdb]..[#replica_bases]'))
+	DROP TABLE #replica_bases
+	create table #replica_bases (dbname sysname NULL, hadr_backup_is_preferred_replica smallint NULL)
+	declare @dbid sysname
+	DECLARE @Q1 NVARCHAR(255)
+	DECLARE c1 cursor FOR
+		SELECT distinct database_id
+		FROM master.sys.dm_hadr_database_replica_states
+		
+	OPEN c1
+	FETCH c1 INTO @dbid
+	IF @@FETCH_STATUS <> 0
+		PRINT 'pas de bases'    
+	WHILE (@@FETCH_STATUS =0)
+	BEGIN
+		SET @Q1 = 'insert into #replica_bases values (db_name('+@dbid+'), sys.fn_hadr_backup_is_preferred_replica(db_name('+@dbid+')))'
+		EXEC sp_executesql @Q1
+		--select @Q1
+		FETCH c1 INTO @dbid
+	END
+	CLOSE c1
+	DEALLOCATE  c1
+	select * from #replica_bases
+	IF EXISTS (SELECT * FROM tempdb..sysobjects
+	WHERE id = object_id(N'[tempdb]..[#replica_bases]'))
+	DROP TABLE #replica_bases
+
+	SET NOCOUNT OFF
 END
-
-
 
 SET NOCOUNT OFF
 
@@ -566,16 +658,28 @@ CREATE TABLE #Errors6 (LogDate DATETIME,ProcessInfo varchar(20),vchMessage varch
 	SELECT TOP 1 LogDate,vchMessage FROM #Errors6 ORDER BY LogDate DESC	
 
 	INSERT INTO #Errors SELECT * FROM #Errors1
+	IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
+	object_id(N'[tempdb]..[#Errors1]'))
 	DROP TABLE #Errors1
 	INSERT INTO #Errors SELECT * FROM #Errors2
+	IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
+	object_id(N'[tempdb]..[#Errors2]'))
 	DROP TABLE #Errors2
 	INSERT INTO #Errors SELECT * FROM #Errors3
+	IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
+	object_id(N'[tempdb]..[#Errors3]'))
 	DROP TABLE #Errors3
 	INSERT INTO #Errors SELECT * FROM #Errors4
+	IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
+	object_id(N'[tempdb]..[#Errors4]'))
 	DROP TABLE #Errors4
 	INSERT INTO #Errors SELECT * FROM #Errors5
+	IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
+	object_id(N'[tempdb]..[#Errors5]'))
 	DROP TABLE #Errors5
 	INSERT INTO #Errors SELECT * FROM #Errors6
+	IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
+	object_id(N'[tempdb]..[#Errors6]'))
 	DROP TABLE #Errors6
 PRINT ''
 PRINT ''
@@ -596,18 +700,34 @@ PRINT ''
 			--AND vchMessage NOT LIKE '%Severity: 16%'
 			)
 	BEGIN
-		IF @COUNT = 0 PRINT 'No critical errors found in errorlogs current to 6'
-	ELSE
-	SELECT LogDate,vchMessage FROM #Errors 
-	WHERE vchMessage LIKE '%Error:%' 
-	AND vchMessage NOT LIKE '%Severity: 0%' 
-	AND vchMessage NOT LIKE '%Severity: 11%'
-	AND vchMessage NOT LIKE '%Severity: 12%'
-	AND vchMessage NOT LIKE '%Severity: 13%'
-	AND vchMessage NOT LIKE '%Severity: 14%'
-	AND vchMessage NOT LIKE '%Severity: 15%'
-	--AND vchMessage NOT LIKE '%Severity: 16%'
-	ORDER BY LogDate
+		IF @COUNT = 0 
+		BEGIN
+			PRINT 'No critical errors found in errorlogs current to 6.'
+		END
+		ELSE
+		BEGIN
+			PRINT 'There are '+CAST(@COUNT AS nvarchar(10))+' critical errors found in the errorlogs.'
+			PRINT ''
+			SELECT DISTINCT vchMessage AS 'Errors found' FROM #Errors
+			WHERE vchMessage LIKE '%Error:%' 
+			AND vchMessage NOT LIKE '%Severity: 0%' 
+			AND vchMessage NOT LIKE '%Severity: 11%'
+			AND vchMessage NOT LIKE '%Severity: 12%'
+			AND vchMessage NOT LIKE '%Severity: 13%'
+			AND vchMessage NOT LIKE '%Severity: 14%'
+			AND vchMessage NOT LIKE '%Severity: 15%'
+			--AND vchMessage NOT LIKE '%Severity: 16%'
+			--SELECT LogDate,vchMessage FROM #Errors 
+			--WHERE vchMessage LIKE '%Error:%' 
+			--AND vchMessage NOT LIKE '%Severity: 0%' 
+			--AND vchMessage NOT LIKE '%Severity: 11%'
+			--AND vchMessage NOT LIKE '%Severity: 12%'
+			--AND vchMessage NOT LIKE '%Severity: 13%'
+			--AND vchMessage NOT LIKE '%Severity: 14%'
+			--AND vchMessage NOT LIKE '%Severity: 15%'
+			--AND vchMessage NOT LIKE '%Severity: 16%'
+			--ORDER BY LogDate DESC
+		END
 	END
 
 
@@ -657,7 +777,9 @@ SET NOCOUNT OFF
 --	END
 
 -- drop #Errors
-	DROP TABLE #Errors
+IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
+object_id(N'[tempdb]..[#Errors]'))
+DROP TABLE #Errors
 GO
 SET NOCOUNT OFF
 PRINT ''
@@ -1550,10 +1672,22 @@ END
 --SET @PRODVER=(SELECT  SERVERPROPERTY('productversion'))
 --IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '9.%' GOTO SQL2005ver
 --IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '10.%' GOTO SQL2008ver
---IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '12.%' GOTO SQL2012ver 
+--IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '11.%' GOTO SQL2012_14ver 
+--IF (SELECT CONVERT(VARCHAR(20),@PRODVER)) LIKE '12.%' GOTO SQL2012_14ver 
+IF (SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]) = 0 GOTO SQL0ver
 IF (SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]) = 9 GOTO SQL2005ver
 IF (SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]) = 10 GOTO SQL2008ver
-IF (SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]) = 12 GOTO SQL2012ver
+IF (SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]) = 10.5 GOTO SQL2008ver
+IF (SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]) = 11 GOTO SQL2012_14ver
+IF (SELECT [sqlver_value] FROM [tempdb].[dbo].[sqlver]) = 12 GOTO SQL2012_14ver
+
+SQL0ver:
+SELECT sc.name, CAST(sc.value AS nvarchar(20)) AS [value]
+		, CAST(sc.value_in_use AS nvarchar(20)) AS [value_in_use]
+		, sc.is_dynamic
+		, sc.description
+FROM master.sys.configurations sc
+GOTO EndCheckConfig
 
 SQL2005ver:
 	-- create temp table with default values
@@ -1763,7 +1897,7 @@ END
 
 GOTO EndCheckConfig
 
-SQL2012ver:
+SQL2012_14ver:
 SELECT CAST(sc.value_in_use AS smallint) AS [maxdop_in_use]
 	, CASE WHEN si.cpu_count / si.hyperthread_ratio > 8 THEN 8 ELSE si.cpu_count / si.hyperthread_ratio END AS [optimal_maxdop_setting]
 	, si.cpu_count
@@ -1774,82 +1908,82 @@ WHERE sc.name = 'max degree of parallelism'
 	-- create temp table with default values
 	-- if the default values changes in the future you have to update the script
 IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
-object_id(N'[tempdb].[dbo].[defaultconf_2012]'))
-DROP TABLE [tempdb].[dbo].[defaultconf_2012]
-CREATE TABLE [tempdb].[dbo].[defaultconf_2012](name nvarchar(35), value sql_variant)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'access check cache bucket count',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'access check cache quota',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'Ad Hoc Distributed Queries',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'affinity I/O mask',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'affinity mask',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'Agent XPs',1)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'allow updates',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'awe enabled',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'backup compression default',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'blocked process threshold (s)',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'c2 audit mode',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'lr enabled',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'common criteria compliance enabled',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'cost threshold for parallelism',5)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'cross db ownership chaining',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'cursor threshold',-1)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'Database Mail XPs',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'default full-text language',1033)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'default language',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'default trace enabled',1)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'disallow results from triggers',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'EKM provider enabled',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'filestream access level',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'fill factor (%)',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'ft crawl bandwidth (max)',100)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'ft crawl bandwidth (min)',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'ft notify bandwidth (max)',100)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'ft notify bandwidth (min)',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'index create memory (KB)',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'in-doubt xact resolution',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'lightweight pooling',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'locks',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'max degree of parallelism',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'max full-text crawl range',4)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'max server memory (MB)',2147483647)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'max text repl size (B)',65536)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'max worker threads',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'media retention',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'min memory per query (KB)',1024)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'min server memory (MB)',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'nested triggers',1)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'network packet size (B)',4096)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'Ole Automation Procedures',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'open objects',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'optimize for ad hoc workloads',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'PH timeout (s)',60)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'precompute rank',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'priority boost',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'query governor cost limit',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'query wait (s)',-1)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'recovery interval (min)',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'remote access',1)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'remote admin connections',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'remote login timeout (s)',20)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'remote proc trans',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'remote query timeout (s)',600)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'Replication XPs',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'scan for startup procs',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'server trigger recursion',1)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'set working set size',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'show advanced options',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'SMO and DMO XPs',1)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'SQL Mail XPs',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'transform noise words',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'two digit year cutoff',2049)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'user connections',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'user options',0)
-INSERT INTO [tempdb].[dbo].[defaultconf_2012] VALUES (N'xp_cmdshell',0)
+object_id(N'[tempdb].[dbo].[defaultconf_2012_14]'))
+DROP TABLE [tempdb].[dbo].[defaultconf_2012_14]
+CREATE TABLE [tempdb].[dbo].[defaultconf_2012_14](name nvarchar(35), value sql_variant)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'access check cache bucket count',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'access check cache quota',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'Ad Hoc Distributed Queries',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'affinity I/O mask',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'affinity mask',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'Agent XPs',1)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'allow updates',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'awe enabled',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'backup compression default',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'blocked process threshold (s)',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'c2 audit mode',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'lr enabled',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'common criteria compliance enabled',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'cost threshold for parallelism',5)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'cross db ownership chaining',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'cursor threshold',-1)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'Database Mail XPs',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'default full-text language',1033)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'default language',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'default trace enabled',1)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'disallow results from triggers',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'EKM provider enabled',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'filestream access level',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'fill factor (%)',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'ft crawl bandwidth (max)',100)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'ft crawl bandwidth (min)',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'ft notify bandwidth (max)',100)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'ft notify bandwidth (min)',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'index create memory (KB)',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'in-doubt xact resolution',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'lightweight pooling',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'locks',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'max degree of parallelism',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'max full-text crawl range',4)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'max server memory (MB)',2147483647)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'max text repl size (B)',65536)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'max worker threads',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'media retention',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'min memory per query (KB)',1024)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'min server memory (MB)',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'nested triggers',1)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'network packet size (B)',4096)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'Ole Automation Procedures',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'open objects',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'optimize for ad hoc workloads',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'PH timeout (s)',60)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'precompute rank',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'priority boost',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'query governor cost limit',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'query wait (s)',-1)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'recovery interval (min)',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'remote access',1)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'remote admin connections',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'remote login timeout (s)',20)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'remote proc trans',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'remote query timeout (s)',600)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'Replication XPs',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'scan for startup procs',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'server trigger recursion',1)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'set working set size',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'show advanced options',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'SMO and DMO XPs',1)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'SQL Mail XPs',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'transform noise words',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'two digit year cutoff',2049)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'user connections',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'user options',0)
+INSERT INTO [tempdb].[dbo].[defaultconf_2012_14] VALUES (N'xp_cmdshell',0)
 
 -- Compare running values with default ones
 IF (SELECT count(sc.name) 
 FROM master.sys.configurations sc
-INNER JOIN [tempdb].[dbo].[defaultconf_2012] dc
+INNER JOIN [tempdb].[dbo].[defaultconf_2012_14] dc
 ON sc.name = dc.name
 WHERE sc.value_in_use != dc.value) = 0
 BEGIN
@@ -1866,7 +2000,7 @@ BEGIN
 			, sc.is_dynamic
 			, sc.description
 	FROM master.sys.configurations sc
-	INNER JOIN [tempdb].[dbo].[defaultconf_2012] dc
+	INNER JOIN [tempdb].[dbo].[defaultconf_2012_14] dc
 	ON sc.name = dc.name
 	WHERE sc.value_in_use != dc.value
 	PRINT ''
@@ -1889,8 +2023,8 @@ object_id(N'[tempdb]..[tempdb].[dbo].[defaultconf_2008]'))
 DROP TABLE [tempdb].[dbo].[defaultconf_2008]
 GO
 IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
-object_id(N'[tempdb]..[tempdb].[dbo].[defaultconf_2012]'))
-DROP TABLE [tempdb].[dbo].[defaultconf_2012]
+object_id(N'[tempdb]..[tempdb].[dbo].[defaultconf_2012_14]'))
+DROP TABLE [tempdb].[dbo].[defaultconf_2012_14]
 GO
 IF EXISTS (SELECT * FROM tempdb..sysobjects WHERE id =
 object_id(N'[tempdb]..[OnlineDB]'))
@@ -1928,4 +2062,3 @@ PRINT '*************************************************************************
 PRINT '				END OF AUDIT					 '
 PRINT '**************************************************************************'
 PRINT ''
-
